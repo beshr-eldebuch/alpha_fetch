@@ -3,3 +3,5 @@ uvicorn==0.29.0
 sqlalchemy==2.0.29
 pydantic==2.7.1
 requests==2.31.0
+slowapi==0.1.9 # for rate limiting - TODO: Discuess the replacement of slowapi with API Gateway rate limiting
+redis==5.0.4
