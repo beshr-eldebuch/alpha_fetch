@@ -6,5 +6,5 @@ services:
       - "8000:80"
     volumes:
       - ./app:/code/app
-    environment:
-      - DATABASE_URL=sqlite:///./test.db
+    env_file:
+      - ./.env
