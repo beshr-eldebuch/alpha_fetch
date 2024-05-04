@@ -1,43 +1,172 @@
+import abc
 import os
 from datetime import datetime
 from typing import Union
-
-from sqlalchemy.orm import Session
-from .models import Stock
 import requests
 import logging
+from sqlalchemy.orm import Session
+from sqlalchemy import desc
+#
+from .models import Stock, StockPrice
+from .schemas import StockResponse
+#
 
-def get_stock_data_from_db(symbol: str, start_date: str, end_date: str, db: Session) -> Stock:
-    query = db.query(Stock).filter(
-        Stock.symbol == symbol,
-        Stock.date >= start_date,
-        Stock.date <= end_date
-    ).all()
-    logging.info(f"Fetched {len(query)} stock data from db for {symbol} between {start_date} and {end_date}")
-    return query
+class IStockRepository:
+    def __init__(self, db: Session):
+        self.db = db
+    @abc.abstractmethod
+    def get_stock_data(
+        self, symbol: str, start_date: str, end_date: str
+    ) -> Union[StockResponse, None]:
+        pass
 
-def create_stock(db: Session, symbol: str, currency: str, close_price: float, date: str) -> Stock:
-    date = datetime.strptime(date, "%Y-%m-%d")
-    stock = Stock(symbol=symbol, currency=currency, close_price=close_price, date=date)
-    db.add(stock)
-    db.commit()
-    db.refresh(stock)
-    logging.info(f"Created stock data for {symbol} on {date}")
-    return stock
+
+class StockDBRepository(IStockRepository):
+    def get_stock_data(
+        self, symbol: str, start_date: str, end_date: str
+    ):
+        query = (
+            self.db.query(
+               Stock.symbol, Stock.currency, StockPrice.date, StockPrice.close, Stock.last_refreshed
+            )
+            .join(Stock, Stock.id == StockPrice.stock_id)
+            .filter(
+                Stock.symbol == symbol, StockPrice.date >= start_date, StockPrice.date <= end_date
+            )
+            .order_by(desc(StockPrice.date))
+            .all()
+        )
+        if not query:
+            logging.info(f"No stock data found in db for {symbol} between {start_date} and {end_date}")
+            return None
+        logging.info(
+            f"Fetched {len(query)} stock data from db for {symbol} between {start_date} and {end_date}"
+        )
+        daily_close = {
+            str(item[2]): item[3] for item in query
+        }
+        last_refreshed = query[0][4] if query else None
+        last_refreshed = last_refreshed.strftime("%Y-%m-%d") if last_refreshed else None
+        return StockResponse(symbol=symbol, currency=query[0][1], daily_close=daily_close, last_refreshed=last_refreshed)
+class StockAPIRepository(IStockRepository):
+    def get_stock_data(
+        self, symbol: str, start_date: str, end_date: str
+    ):
+        API_KEY = os.environ.get("ALPHA_API_KEY")
+        logging.info(f"Fetching stock data from AlphaVantage for {symbol}")
+        url = f"https://alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&apikey={API_KEY}"
+        try:
+            response = requests.get(url)
+            if response.status_code == 200:
+                last_refreshed = response.json().get("Meta Data", {}).get("3. Last Refreshed")
+                data = response.json().get("Time Series (Daily)", {})
+                daily_close = {}
+                for date, values in data.items():
+                    close_price = float(values.get("4. close"))
+                    daily_close[str(date)] = close_price
+                stock_res = StockResponse(symbol=symbol, currency="USD", daily_close=daily_close, last_refreshed=last_refreshed)
+                # cache stock data in db
+                self.cache_stock_data(stock_res)
+                # filter data between start_date and end_date
+                stock_res.daily_close = {
+                    date: price
+                    for date, price in stock_res.daily_close.items()
+                    if start_date <= date <= end_date
+                }
+                return stock_res
+            logging.error(
+                f"Failed to fetch stock data from AlphaVantage for {symbol} between {start_date} and {end_date} with status code {response.status_code}"
+            )
+            return None
+        except requests.exceptions.RequestException as e:
+            logging.error(
+                f"Failed to fetch stock data from AlphaVantage for {symbol} between {start_date} and {end_date}"
+            )
+            logging.error(e)
+            return None
+    def cache_stock_data(
+        self, stock: StockResponse
+    ) -> None:
+        """
+        Cache stock data in db to avoid frequent API calls.
+        Since we're storing daily close price data, it makes sense to call the api once a day and store the data in the database.
+        """
+        # check if stock already exists in db
+        stock_db = self.db.query(Stock).filter(Stock.symbol == stock.symbol).first()
+        if not stock_db:
+            # Create new stock record
+            last_refreshed = datetime.strptime(stock.last_refreshed, "%Y-%m-%d")
+            stock_db = Stock(symbol=stock.symbol, currency=stock.currency, last_refreshed=last_refreshed)
+            logging.info(f"Created stock record for {stock.symbol}")
+            self.db.add(stock_db)
+            self.db.commit()
+        # Get last date for which stock data is cached
+        last_date = self.db.query(StockPrice.date).filter(StockPrice.stock_id == stock_db.id).order_by(StockPrice.date.desc()).first()
+        last_date = last_date[0] if last_date else None
+        # Cache stock price data, starting from the next day of last cached date
+        for date, close_price in stock.daily_close.items():
+            if last_date and date <= last_date:
+                continue
+            date_obj = datetime.strptime(date, "%Y-%m-%d")
+            stock_price = StockPrice(stock_id=stock_db.id, date=date_obj, close=close_price)
+            self.db.add(stock_price)
+            self.db.commit()
+        logging.info(f"Cached stock data for {stock.symbol} between {min(stock.daily_close.keys())} and {max(stock.daily_close.keys())}")
+
+
+class StockService:
+    def __init__(self, api_repo: StockAPIRepository, db_repo: StockDBRepository, db: Session):
+        self.api_repo = api_repo
+        self.db_repo = db_repo
+        self.db = db
+
+    def get_processed_stock_data(self, symbol: str, start_date: str, end_date: str, currency: str):
+        # Check if stock data is available in db, else fetch from API
+        stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
+        if not stock or (datetime.utcnow() - stock.last_refreshed).days > 1:
+            logging.info(f"Stock data not found in db or stale for {symbol}")
+            stock_data = self.api_repo.get_stock_data(symbol, start_date, end_date)
+        else:
+            logging.info(f"Stock data found in db for {symbol}")
+            stock_data = self.db_repo.get_stock_data(symbol, start_date, end_date)
+
+        if not stock_data:
+            raise ValueError("No stock data found")
+
+        exchange_rate = get_exchange_rate('USD', currency)
+        if exchange_rate is None:
+            raise ValueError("Failed to fetch exchange rate")
+
+        stock_data.daily_close  = {date: price * exchange_rate for date, price in stock_data.daily_close.items()}
+
+        return stock_data
+
 
 def get_exchange_rate(src_currency: str, dest_currency: str) -> Union[float, None]:
-    API_KEY = os.environ.get('API_KEY')
-    logging.info(f"Fetching currency exchange rate from {src_currency} to {dest_currency}")
+    API_KEY = os.environ.get("ALPHA_API_KEY")
+    logging.info(
+        f"Fetching currency exchange rate from {src_currency} to {dest_currency}"
+    )
     url = f"https://alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={src_currency}&to_currency={dest_currency}&apikey={API_KEY}"
     try:
         response = requests.get(url)
         if response.status_code == 200:
-            rate = response.json().get('Realtime Currency Exchange Rate',{}).get('5. Exchange Rate')
+            rate = (
+                response.json()
+                .get("Realtime Currency Exchange Rate", {})
+                .get("5. Exchange Rate")
+            )
+            logging.info(
+                f"Currency exchange rate from {src_currency} to {dest_currency} is {rate}"
+            )
             return float(rate) if rate else None
-        logging.error(f"Failed to fetch currency exchange rate from {src_currency} to {dest_currency} with status code {response.status_code}")
+        logging.error(
+            f"Failed to fetch currency exchange rate from {src_currency} to {dest_currency} with status code {response.status_code}"
+        )
         return None
     except requests.exceptions.RequestException as e:
-        logging.error(f"Failed to fetch currency exchange rate from {src_currency} to {dest_currency}")
+        logging.error(
+            f"Failed to fetch currency exchange rate from {src_currency} to {dest_currency}"
+        )
         logging.error(e)
         return None
-
