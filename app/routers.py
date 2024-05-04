@@ -1,12 +1,13 @@
 import logging
 #
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 #
 from .schemas import StockRequest, StockResponse
 from .services import get_stock_data_from_db, get_exchange_rate, create_stock
 from .database import SessionLocal, engine
 from . import  models
+from .rate_limiter import limiter
 #
 router = APIRouter()
 
@@ -24,8 +25,11 @@ def health_check():
     return {"status": "ok"}
 
 @router.get("/stocks", response_model=StockResponse)
-def get_stock_data(stock_req: StockRequest = Depends(),
-                   db: Session = Depends(get_db)):
+@limiter.limit("25/day")
+def get_stock_data(request: Request,
+                   stock_req: StockRequest = Depends(),
+                   db: Session = Depends(get_db)
+                   ):
 
     # Read stock from db between start date and end date
     stock_data = get_stock_data_from_db(stock_req.symbol, stock_req.start_date, stock_req.end_date, db)
