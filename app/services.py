@@ -25,6 +25,9 @@ class StockDBRepository(IStockRepository):
     def get_stock_data(
         self, symbol: str, start_date: str, end_date: str
     ):
+        """
+        Get stock data from db for the given symbol and date range.
+        """
         query = (
             self.db.query(
                Stock.symbol, Stock.currency, StockPrice.date, StockPrice.close, Stock.last_refreshed
@@ -52,13 +55,17 @@ class StockAPIRepository(IStockRepository):
     def get_stock_data(
         self, symbol: str, start_date: str, end_date: str
     ):
+        """
+        Fetch stock data from AlphaVantage API for the given symbol and date range.
+        """
         API_KEY = os.environ.get("ALPHA_API_KEY")
         logging.info(f"Fetching stock data from AlphaVantage for {symbol}")
         url = f"https://alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={symbol}&apikey={API_KEY}"
         try:
             response = requests.get(url)
             if response.status_code == 200:
-                last_refreshed = response.json().get("Meta Data", {}).get("3. Last Refreshed")
+                # last refreshed date = last API call date.
+                last_refreshed = datetime.now().strftime("%Y-%m-%d")
                 data = response.json().get("Time Series (Daily)", {})
                 daily_close = {}
                 for date, values in data.items():
@@ -105,9 +112,9 @@ class StockAPIRepository(IStockRepository):
         last_date = last_date[0] if last_date else None
         # Cache stock price data, starting from the next day of last cached date
         for date, close_price in stock.daily_close.items():
-            if last_date and date <= last_date:
+            date_obj = datetime.strptime(date, "%Y-%m-%d").date()
+            if last_date and date_obj <= last_date:
                 continue
-            date_obj = datetime.strptime(date, "%Y-%m-%d")
             stock_price = StockPrice(stock_id=stock_db.id, date=date_obj, close=close_price)
             self.db.add(stock_price)
             self.db.commit()
@@ -120,20 +127,23 @@ class StockService:
         self.db_repo = db_repo
         self.db = db
 
-    def get_processed_stock_data(self, symbol: str, start_date: str, end_date: str, currency: str):
+    def get_processed_stock_data(self, symbol: str, start_date: str, end_date: str, currency: str) -> StockResponse:
+        """
+        Get stock data for the given symbol and date range.
+        If stock data is not present in db or stale, fetch it from API.
+        If stock data is present in db and not stale, fetch it from db.
+        Convert the stock price to the given currency.
+        """
         # Check if stock data is available in db, else fetch from API
-        stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
-        if not stock or (datetime.utcnow() - stock.last_refreshed).days > 1:
-            logging.info(f"Stock data not found in db or stale for {symbol}")
+        if self.is_data_needs_refresh(symbol, end_date):
             stock_data = self.api_repo.get_stock_data(symbol, start_date, end_date)
         else:
-            logging.info(f"Stock data found in db for {symbol}")
             stock_data = self.db_repo.get_stock_data(symbol, start_date, end_date)
 
         if not stock_data:
             raise ValueError("No stock data found")
 
-        exchange_rate = get_exchange_rate('USD', currency)
+        exchange_rate = get_exchange_rate(stock_data.currency, currency)
         if exchange_rate is None:
             raise ValueError("Failed to fetch exchange rate")
 
@@ -141,8 +151,31 @@ class StockService:
 
         return stock_data
 
+    def is_data_needs_refresh(self, symbol: str, end_date: str) -> bool:
+        """
+        Check if stock data needs to be refreshed from API.
+        If stock data is not present in db, return True.
+        If stock data is present in db and last refreshed date is older than 1 day, return True.
+        If stock data is present in db and last refreshed date is same or older than end_date, return False ( we already have the data).
+        """
+        stock = self.db.query(Stock).filter(Stock.symbol == symbol).first()
+        if not stock:
+            logging.info(f"No stock data found in db for {symbol}")
+            return True
+        if end_date <= stock.last_refreshed.strftime("%Y-%m-%d"):
+            logging.info(f"Stock data found in db for {symbol}, no refresh needed")
+            return False
+        if (datetime.utcnow() - stock.last_refreshed).days > 1:
+            logging.info(f"Stock data found in db for {symbol}, but stale, needs refresh")
+            return True
+        logging.info(f"Stock data found in db for {symbol}, no refresh needed")
+        return False
 
 def get_exchange_rate(src_currency: str, dest_currency: str) -> Union[float, None]:
+    """
+    Fetch currency exchange rate from AlphaVantage API.
+    Since the exchange rate is dynamic, we fetch it from the API every time.
+    """
     API_KEY = os.environ.get("ALPHA_API_KEY")
     logging.info(
         f"Fetching currency exchange rate from {src_currency} to {dest_currency}"

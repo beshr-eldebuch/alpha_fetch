@@ -12,5 +12,5 @@ class StockRequest(BaseModel):
 class StockResponse(BaseModel):
     symbol: str = Field(..., description="Stock symbol like 'AAPL'")
     currency: str = Field(..., description="Currency code like 'USD'")
-    last_refreshed: str = Field(..., description="Last refreshed date in YYYY-MM-DD format")
+    last_refreshed: str = Field(..., description="Last refreshed date in YYYY-MM-DD format, when the api data was last called")
     daily_close: Dict[str, float] = Field(..., description="Daily close price in the given currency")
