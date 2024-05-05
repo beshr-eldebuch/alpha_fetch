@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
+from datetime import datetime
 #
 from .schemas import StockRequest, StockResponse
 from .services import StockService, StockDBRepository, StockAPIRepository
@@ -28,6 +29,15 @@ def get_stock_data(request: Request,
                    stock_req: StockRequest = Depends(),
                    db: Session = Depends(get_db)
                    ):
+    try:
+        start_date = datetime.strptime(stock_req.start_date, "%Y-%m-%d")
+        end_date = datetime.strptime(stock_req.end_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    if end_date < start_date:
+        raise HTTPException(status_code=400, detail="End date must be after start date.")
+
     stock_service = StockService(StockAPIRepository(db), StockDBRepository(db), db)
     try:
         result = stock_service.get_processed_stock_data(stock_req.symbol, stock_req.start_date, stock_req.end_date, stock_req.currency)
